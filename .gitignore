@@ -1,0 +1,43 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Extracted test data directories
+extracted_locomotion/
+extracted_data_ros2/
+extracted_navigation/
+
+# Pickle files (generated data)
+*.pkl
+
+# Image files (test data)
+*.jpg
+*.jpeg
+*.png
+*.gif
+
+# Camera data files (test output)
+camera_data.txt
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ROS2 build artifacts
+build/
+install/
+log/
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
