@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ROS2-based script to read locomotion collection bag files including ZED camera data
-Extends NavigationBagReaderROS2 to handle timestamped sequences and camera data
+Uses UnitreeBagReaderROS2 for IMU/lowstate extraction and bag utilities
 
 Author: Extended for locomotion data processing
 Date: 2025-10-20
@@ -21,80 +21,78 @@ import rclpy
 from rclpy.serialization import deserialize_message
 from rosbag2_py import SequentialReader, StorageOptions, ConverterOptions
 
-# Standard ROS2 message imports
+# Standard ROS2 message imports (for camera data)
 from sensor_msgs.msg import CompressedImage, CameraInfo, Image
 
-# Unitree message imports
-from unitree_hg.msg import IMUState, LowState, LowCmd
-from unitree_go.msg import SportModeState, WirelessController
-
-# Import the base class from existing script
+# Import the bag reader from existing script
 import sys
 sys.path.append(str(Path(__file__).parent))
-from read_navigation_bag_ros2 import NavigationBagReaderROS2, get_logger
+from UnitreeReader import UnitreeBagReaderROS2, get_logger
 
 
-class LocomotionBagReaderROS2(NavigationBagReaderROS2):
+class LocomotionBagReaderROS2:
     """
-    Extended ROS2 reader for locomotion collection with ZED camera support
-    Inherits navigation data extraction from NavigationBagReaderROS2
+    Multi-bag reader for locomotion collections with ZED camera support.
+    Handles timestamped sequences (zed, other, livox). Uses UnitreeBagReaderROS2
+    via composition for IMU/lowstate extraction.
     """
 
     def __init__(self, collection_path: str, logger: Optional[logging.Logger] = None):
         """
-        Initialize locomotion bag reader
-
         Args:
-            collection_path: Path to locomotion collection directory or specific sequence
-            logger: Optional logger instance (creates default if not provided)
+            collection_path: Path to collection directory or specific sequence
+            logger: Optional logger (creates default if None)
         """
-        # Set up temporary logger before parent initialization
+        # Set up logger
         if logger is None:
-            temp_logger = get_logger(self.__class__.__name__)
-        else:
-            temp_logger = logger
+            logger = get_logger(self.__class__.__name__)
+        self.logger = logger
+        
+        # Initialize ROS2 if not already done
+        if not rclpy.ok():
+            rclpy.init()
         
         self.collection_path = Path(collection_path)
         self.sequence_name = None
         self.bag_paths = {}
 
-        # Discover bag structure (using temporary logger)
-        self.logger = temp_logger
+        # Discover bag structure
         self._discover_locomotion_bags()
 
-        # Initialize ROS2 if not already done
-        if not rclpy.ok():
-            rclpy.init()
-
-        # Set up base class attributes - initialize parent with dummy path first
-        # We'll set the actual bag_path after discovery
-        dummy_path = self.bag_paths.get('other', collection_path)
-        super().__init__(str(dummy_path), logger=logger)
-        
-        # Update bag_path after parent initialization (parent init may override logger)
-        # Ensure logger is set correctly after parent init
-        if logger is not None:
-            self.logger = logger
-        
-        if 'other' in self.bag_paths:
-            self.bag_path = self.bag_paths['other']
-        else:
-            self.bag_path = None
-        self.reader = None
-
-        # Extend message type mappings for camera data (inherit from parent and extend)
-        self.msg_type_map.update({
+        # Message type mappings (camera messages)
+        self.msg_type_map = {
             'sensor_msgs/msg/CompressedImage': CompressedImage,
             'sensor_msgs/msg/CameraInfo': CameraInfo,
             'sensor_msgs/msg/Image': Image,
-        })
+        }
+        
+        # Create single bag reader for 'other' bag if available (for IMU/lowstate extraction)
+        self._other_bag_reader = None
+        if 'other' in self.bag_paths:
+            self._other_bag_reader = UnitreeBagReaderROS2(str(self.bag_paths['other']), logger=logger)
+    
+    def _setup_bag_reader(self, bag_path: Path) -> SequentialReader:
+        """Create bag reader using UnitreeBagReaderROS2 utilities."""
+        # Use UnitreeBagReaderROS2's static method for format detection
+        storage_format = UnitreeBagReaderROS2._get_storage_format(bag_path)
+        storage_options = StorageOptions(uri=str(bag_path), storage_id=storage_format)
+        converter_options = ConverterOptions('', '')
+        
+        reader = SequentialReader()
+        reader.open(storage_options, converter_options)
+        return reader
+    
+    def get_topic_types_for_bag(self, bag_type: str) -> Dict[str, str]:
+        """Get topic types for specified bag type."""
+        if bag_type not in self.bag_paths:
+            return {}
+        # Use UnitreeBagReaderROS2's utility method
+        temp_reader = UnitreeBagReaderROS2(str(self.bag_paths[bag_type]), logger=self.logger)
+        return temp_reader.get_topic_types_for_bag(self.bag_paths[bag_type])
 
 
     def _discover_locomotion_bags(self):
-        """
-        Discover locomotion collection bag structure
-        Handles timestamped sequences like navigation_bag_YYYYMMDD_HHMMSS_type
-        """
+        """Discover bag structure from timestamped sequences."""
         if self.collection_path.is_file():
             # Single bag file - extract directory info
             parent_dir = self.collection_path.parent
@@ -158,17 +156,7 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
     def extract_zed_images(self, save_images: bool = False,
                           output_dir: Optional[str] = None,
                           max_images: Optional[int] = None) -> Dict[str, List[Dict]]:
-        """
-        Extract ZED stereo camera images
-
-        Args:
-            save_images: Whether to save images to disk
-            output_dir: Directory to save images
-            max_images: Maximum images per camera (None = all)
-
-        Returns:
-            Dictionary with left/right image data
-        """
+        """Extract ZED stereo camera images."""
         if 'zed' not in self.bag_paths:
             self.logger.warning("No ZED bag found in sequence")
             return {'left_images': [], 'right_images': []}
@@ -258,7 +246,7 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
         }
 
     def _extract_single_camera_info(self, msg: CameraInfo, timestamp: int) -> Dict:
-        """Extract camera info from a single CameraInfo message"""
+        """Extract camera info from CameraInfo message."""
         return {
             'timestamp': timestamp / 1e9,
             'frame_id': msg.header.frame_id,
@@ -281,12 +269,7 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
         }
 
     def extract_camera_info(self) -> Dict[str, List[Dict]]:
-        """
-        Extract ZED camera calibration parameters
-
-        Returns:
-            Dictionary with left/right camera calibration info
-        """
+        """Extract ZED camera calibration parameters."""
         if 'zed' not in self.bag_paths:
             self.logger.warning("No ZED bag found")
             return {'left_camera_info': [], 'right_camera_info': []}
@@ -324,50 +307,58 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
             'right_camera_info': right_camera_info
         }
 
-    def extract_imu_and_lowstate(self) -> Dict[str, List]:
+    def extract_imu_and_lowstate(self) -> Dict:
         """
-        Extract IMU and lowstate data from navigation bag
+        Extract IMU and lowstate data from navigation bag.
         
         Returns:
-            Dictionary with 'imu_data' and 'lowstate_data' keys
+            Dict with 'imu_data' (Dict[np.ndarray] format) and 'lowstate_data' (Dict[np.ndarray] format)
         """
-        imu_data = []
-        lowstate_data = []
-        
-        if 'other' not in self.bag_paths:
+        if self._other_bag_reader is None:
             self.logger.warning("No navigation bag found (no 'other' bag)")
-            return {'imu_data': imu_data, 'lowstate_data': lowstate_data}
+            # Return empty data in Dict[np.ndarray] format
+            empty_imu = {
+                'timestamp': np.array([]),
+                'quaternion': np.array([]).reshape(0, 4),
+                'gyroscope': np.array([]).reshape(0, 3),
+                'accelerometer': np.array([]).reshape(0, 3),
+                'rpy': np.array([]).reshape(0, 3),
+                'temperature': np.array([])
+            }
+            empty_lowstate = {
+                'timestamp': np.array([]),
+                'motor_state': {
+                    'mode': np.array([]).reshape(0, 0),
+                    'q': np.array([]).reshape(0, 0),
+                    'dq': np.array([]).reshape(0, 0),
+                    'ddq': np.array([]).reshape(0, 0),
+                    'tau_est': np.array([]).reshape(0, 0),
+                    'temperature': np.array([]).reshape(0, 0),
+                },
+                'imu': {
+                    'quaternion': np.array([]).reshape(0, 4),
+                    'gyroscope': np.array([]).reshape(0, 3),
+                    'accelerometer': np.array([]).reshape(0, 3),
+                }
+            }
+            return {'imu_data': empty_imu, 'lowstate_data': empty_lowstate}
         
         self.logger.info("\n--- Extracting Navigation Sensor Data ---")
-        # Create a temporary reader for the 'other' bag
-        other_reader = self._setup_bag_reader(self.bag_paths['other'])
-        
-        # Temporarily swap reader to extract from 'other' bag
-        original_reader = self.reader
-        self.reader = other_reader
-
-        imu_data = self.extract_imu_data()
-        lowstate_data = self.extract_lowstate_data()
-
-        # Restore original reader
-        self.reader = original_reader
-        other_reader = None  # Close temporary reader
+        imu_data = self._other_bag_reader.extract_imu_data()  # Returns Dict[np.ndarray]
+        lowstate_data = self._other_bag_reader.extract_lowstate_data()  # Returns Dict[np.ndarray]
         
         return {'imu_data': imu_data, 'lowstate_data': lowstate_data}
 
-    def save_locomotion_dataset(self, output_dir: str, imu_data: List, 
-                                lowstate_data: List, image_counts: Optional[Dict] = None) -> Path:
+    def save_locomotion_dataset(self, output_dir: str, imu_data: Dict[str, np.ndarray], 
+                                lowstate_data: Dict[str, np.ndarray], image_counts: Optional[Dict] = None) -> Path:
         """
-        Save locomotion dataset with IMU and lowstate data to pickle file
+        Save locomotion dataset (IMU, lowstate, image counts) to pickle file.
         
         Args:
             output_dir: Output directory path
-            imu_data: List of IMU data entries
-            lowstate_data: List of lowstate data entries
-            image_counts: Optional dict with 'left_images' and 'right_images' counts
-            
-        Returns:
-            Path to saved file
+            imu_data: IMU data in Dict[np.ndarray] format (from extract_imu_data)
+            lowstate_data: Lowstate data in Dict[np.ndarray] format (from extract_lowstate_data)
+            image_counts: Optional dict with image counts
         """
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
@@ -377,14 +368,8 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
             'sequence_name': self.sequence_name,
             'extraction_timestamp': datetime.now().isoformat(),
             'bag_paths': {k: str(v) for k, v in self.bag_paths.items()},
-            'imu_data': imu_data,
-            'lowstate_data': lowstate_data,
-            'data_counts': {
-                'imu_messages': len(imu_data),
-                'lowstate_messages': len(lowstate_data),
-                'left_images': image_counts.get('left_images', 0) if image_counts else 0,
-                'right_images': image_counts.get('right_images', 0) if image_counts else 0
-            }
+            'imu_data': imu_data,  # Dict[np.ndarray] format
+            'lowstate_data': lowstate_data  # Dict[np.ndarray] format
         }
 
         # Save locomotion dataset
@@ -392,23 +377,18 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
         with open(dataset_path, "wb") as f:
             pickle.dump(complete_dataset, f)
         
+        # Get message counts from timestamp array lengths for logging
+        imu_count = len(imu_data['timestamp']) if 'timestamp' in imu_data else 0
+        lowstate_count = len(lowstate_data['timestamp']) if 'timestamp' in lowstate_data else 0
+        
         self.logger.info(f"Saved locomotion dataset: {dataset_path}")
-        self.logger.info(f"  IMU messages: {len(imu_data)}")
-        self.logger.info(f"  Lowstate messages: {len(lowstate_data)}")
+        self.logger.info(f"  IMU messages: {imu_count}")
+        self.logger.info(f"  Lowstate messages: {lowstate_count}")
         
         return dataset_path
 
     def save_camera_data(self, output_dir: str, camera_info: Dict[str, List[Dict]]) -> Optional[Path]:
-        """
-        Save camera intrinsic calibration parameters to text file
-        
-        Args:
-            output_dir: Output directory path
-            camera_info: Dictionary with 'left_camera_info' and 'right_camera_info' keys
-            
-        Returns:
-            Path to saved file if camera info exists, None otherwise
-        """
+        """Save camera intrinsic calibration parameters to text file."""
         if not camera_info.get('left_camera_info') and not camera_info.get('right_camera_info'):
             self.logger.warning("No camera calibration info to save")
             return None
@@ -461,15 +441,7 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
 
     def save_locomotion_data(self, output_dir: str, save_images: bool = True,
                            max_images: Optional[int] = None):
-        """
-        Extract and save locomotion dataset with IMU and lowstate data
-        Saves camera calibration info as text file
-
-        Args:
-            output_dir: Output directory for all data
-            save_images: Whether to save image files
-            max_images: Max images per camera (None = all)
-        """
+        """Extract and save locomotion dataset (IMU, lowstate, camera data)."""
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
@@ -506,22 +478,10 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
 
         # Print summary statistics
         self.logger.info("\nData Summary:")
-        self.logger.info(f"  IMU messages: {len(imu_data)}")
-        self.logger.info(f"  Lowstate messages: {len(lowstate_data)}")
+        self.logger.info(f"  IMU messages: {len(imu_data['timestamp']) if 'timestamp' in imu_data else 0}")
+        self.logger.info(f"  Lowstate messages: {len(lowstate_data['timestamp']) if 'timestamp' in lowstate_data else 0}")
         self.logger.info(f"  Left images: {image_counts['left_images']}")
         self.logger.info(f"  Right images: {image_counts['right_images']}")
-
-    def get_topic_types_for_bag(self, bag_type: str) -> Dict[str, str]:
-        """Get topics for specific bag type"""
-        if bag_type not in self.bag_paths:
-            return {}
-
-        # Always use format-aware reader for consistency
-        reader = self._setup_bag_reader(self.bag_paths[bag_type])
-        topic_types = reader.get_all_topics_and_types()
-        result = {info.name: info.type for info in topic_types}
-        reader = None  # Close reader
-        return result
 
     def print_summary(self):
         """Print comprehensive summary of locomotion sequence"""
@@ -536,10 +496,12 @@ class LocomotionBagReaderROS2(NavigationBagReaderROS2):
             self.logger.info(f"   Topics: {len(topic_types)}")
 
             for topic_name, msg_type in topic_types.items():
-                self.logger.info(f"   📡 {topic_name}")
-                self.logger.info(f"      Type: {msg_type}")
-                has_handler = "✅" if msg_type in self.msg_type_map else "❌"
-                self.logger.info(f"      Handler Available: {has_handler}")
+                self.logger.info(f"   📡 {topic_name}: {msg_type}")
+    
+    def __del__(self):
+        """Clean up resources"""
+        if self._other_bag_reader is not None:
+            self._other_bag_reader = None
 
 
 def main():
@@ -576,6 +538,7 @@ def main():
                 save_images=not args.no_images,
                 max_images=args.max_images
             )
+        
 
     except Exception as e:
         logger = get_logger(__name__)
